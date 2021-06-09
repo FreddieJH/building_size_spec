@@ -1,0 +1,841 @@
+---
+title: "Building up the community size spectrum from species size distributions"
+author: "F. J. Heather"
+date: "25/02/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Package installation and loading ----------------------------------------------------------
+
+list.of.packages <- 
+  c("tidyverse", 
+    "cowplot"
+  )
+
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages, dependencies = T, repos = "http://cran.us.r-project.org")
+lapply(list.of.packages, require, character.only = T)
+rm(list.of.packages, new.packages)
+
+# Data loading -------------------------------------------------------------------------------
+
+bins <- 
+  data.frame(bin_num = 1:50) %>% 
+  mutate(
+    bin_floor = 2^bin_num,
+    bin_ceiling = 2^(bin_num + 1),
+    bin_mid = (bin_floor + bin_ceiling) / 2,
+    bin_width = bin_ceiling - bin_floor
+  )
+
+# Options ------------------------------------------------------------------------------------
+
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, echo = TRUE)
+# full_load = T
+# mass_range <- 2^(1:17)  # from 2g to 131.072kg
+
+
+# Functions ------------------------------------------------------------------------------------
+
+`%!in%` <- Negate(`%in%`)
+
+save_as_plot <- function(plot, filename, output_type, dpi = 300, height = 10, units ="in", asp_ratio = 1.618){
+  if(!dir.exists("output")){
+    dir.create("output")
+  }
+  if(!dir.exists("output/figs")){
+    dir.create("output/figs")
+  }
+  if("eps" %in% output_type){
+    if(!dir.exists("output/figs/eps")){
+      dir.create("output/figs/eps")
+    }
+    ggplot2::ggsave(paste0("output/figs/eps/", filename,".eps"), plot = plot, device=cairo_ps, fallback_resolution = dpi, height = height, width = (height*asp_ratio), units = units)
+    output_type <- output_type[output_type != "eps"]
+  }
+  for(i in output_type){
+    if(!dir.exists(paste0("output/figs/", i))){
+      dir.create(paste0("output/figs/", i))
+    }
+    cowplot::save_plot(filename = paste0("output/figs/", i,"/", filename,".", i), plot = plot, dpi=dpi, base_height = height)
+  }
+}
+
+```
+
+# Important numbers:
+
+```{r}
+
+```
+
+
+
+
+# Functions
+
+```{r}
+
+# get the total abundance for the site
+get_n_s <- function(df){
+  df %>% 
+    group_by(s) %>% 
+    nest() %>% 
+    mutate(n_s = map_dbl(data, ~sum(.x$n_ks, na.rm = T))) %>% 
+    unnest(cols = c(data))
+}
+
+# weighted sum of lognormal distributions
+sum_dist <- function(x, meanlog_vec, sdlog_vec, weight_vec){
+  totl <- rep(0, length(x))
+  for(i in seq_along(meanlog_vec)){
+    totl <- totl + weight_vec[i]*dlnorm(x       = x, 
+                                        meanlog = meanlog_vec[i], 
+                                        sdlog   = sdlog_vec[i])
+  }
+  return(totl)
+}
+
+# function to sum lnorms
+sum_lnorms <- function(df, min, max) integrate(function(x) sum_dist(x, 
+                                                                    sdlog_vec = df$sigma_k, 
+                                                                    meanlog_vec = df$mu_k, 
+                                                                    weight_vec = df$n_ks), 
+                                               lower = min,  
+                                               upper = max)$value
+
+# get the community distribution (sum of SSDs)
+# using a max-mass bin of 10 because don't know how big the individuals get 2^15 = 1kg
+combine_dists <- function(df, group_var = "s") {
+  df %>% 
+    group_by_at(c(group_var, "n_s")) %>% 
+    nest() %>% 
+    mutate(empty_table = list(bins %>% filter(bin_num <= 20))) %>% 
+    unnest(cols = c(empty_table)) %>% 
+    mutate(n_s_fit = pmap_dbl(.l = list(data, bin_floor, bin_ceiling), sum_lnorms)) %>% 
+    select(-data) %>% 
+    mutate(pm_s = n_s_fit/n_s) %>% 
+    rename(m = bin_mid) %>% 
+    mutate(norm_density = n_s_fit/bin_width) %>% 
+    mutate(density = n_s_fit) %>% 
+    # removing size bins that are expected to contain >1 indiv per transect
+    left_join(nsurv) %>% 
+    mutate(est_survey_abundance = n_s_fit*500*n_surveys) %>% 
+    filter(est_survey_abundance > 1)
+  
+}
+
+
+```
+
+# Test sites data 
+
+```{r}
+
+test_data <- 
+  read_csv("data/base/rls_testsites.csv") # only species ID and abundance, and N_surveys
+mass_lnorm_pars <- 
+  read_csv("data/base/mass_lnorm_pars.csv") # SMDs based on the training data
+mass_lnorm_pars_LMAX <- 
+  read_csv("data/base/mass_lnorm_pars_LMAX.csv") # SMDs based on LMAX
+test_obs <- 
+  read_csv("data/base/testsites_obs.csv")
+nsurv <- 
+  read_csv("data/base/nsurv.csv")
+
+test_fit_SSD <-
+  test_data %>% 
+  left_join(mass_lnorm_pars) %>% 
+  na.omit() %>% 
+  get_n_s() %>% 
+  combine_dists() %>% 
+  ungroup() %>% 
+  select(s, m, density, norm_density) %>% 
+  mutate(source = "est")
+
+test_fit_LMAX <-
+  test_data %>% 
+  left_join(mass_lnorm_pars_LMAX) %>% 
+  na.omit() %>% 
+  get_n_s() %>% 
+  combine_dists() %>% 
+  ungroup() %>% 
+  select(s, m, density, norm_density) %>% 
+  mutate(source = "LMAX")
+
+lm_coefs <- 
+  test_obs %>% 
+  na.omit() %>% 
+  group_by(s) %>% 
+  nest() %>% 
+  mutate(mod = map(.x = data, ~lm(log2(.x$density) ~ log2(.x$m)))) %>% 
+  mutate(beta = map_dbl(mod, ~ .x$coefficients[1]),
+         lambda = map_dbl(mod, ~ .x$coefficients[2]),
+         rsq =  map_dbl(mod, ~ summary(.x)$adj.r.squared)) %>% 
+  mutate(mod_norm = map(.x = data, ~lm(log2(.x$norm_density) ~ log2(.x$m)))) %>% 
+  mutate(beta_norm = map_dbl(mod_norm, ~ .x$coefficients[1]),
+         lambda_norm = map_dbl(mod_norm, ~ .x$coefficients[2]),
+         rsq_norm =  map_dbl(mod_norm, ~ summary(.x)$adj.r.squared)) %>% 
+  select(s, beta, lambda, rsq, beta_norm, lambda_norm, rsq_norm)
+
+
+test_fit_lm <- 
+  test_obs %>% 
+  left_join(lm_coefs %>% select(s, beta, lambda, beta_norm, lambda_norm)) %>% 
+  mutate(density = 2^(beta + lambda*log2(m))) %>% 
+  mutate(norm_density = 2^(beta_norm + lambda_norm*log2(m))) %>% 
+  select(-c(beta, lambda, beta_norm, lambda_norm)) %>% 
+  mutate(source = "lmfit")
+
+comm_pdf_all <-
+  test_obs %>% 
+  bind_rows(test_fit_SSD) %>% 
+  bind_rows(test_fit_LMAX) %>% 
+  bind_rows(test_fit_lm)
+
+```
+
+
+# Figure 1
+
+```{r example method}
+
+site_ssd_pars <- read_csv("data/base/aceh1_ssd_pars.csv")
+
+
+# Weighted sum of lognormal distributions
+sum_dist <- function(x, meanlog_vec, sdlog_vec, weight_vec){
+  totl <- rep(0, length(x))
+  for(i in seq_along(meanlog_vec)){
+    totl <- totl + weight_vec[i]*dlnorm(x       = x, 
+                                        meanlog = meanlog_vec[i], 
+                                        sdlog   = sdlog_vec[i])
+  }
+  return(totl)
+}
+
+site_comm_pdf <-
+  site_ssd_pars %>% 
+  group_by(s, n_s) %>% 
+  nest() %>% 
+  mutate(total_pm_s = map(.x = data,
+                          .f = ~sum_dist(x = 1:1024,
+                                         meanlog_vec = .x$mu_k,
+                                         sdlog_vec   = .x$sigma_k,
+                                         weight_vec  = .x$n_ks))) %>%
+  select(-data) %>%
+  mutate(m = list(1:1024)) %>% 
+  unnest(cols = c(total_pm_s, m)) %>% 
+  mutate(pm_s = total_pm_s/n_s) %>% 
+  select(-total_pm_s)
+
+
+site_ssd <- 
+  site_ssd_pars %>% 
+  mutate(m_ks = list(seq(1, 1000, by = 0.1))) %>% 
+  mutate(p_m_ks = pmap(list(x = m_ks, 
+                            sdlog = sigma_k, 
+                            meanlog = mu_k), dlnorm)) %>% 
+  unnest(cols = c(m_ks, p_m_ks)) %>% 
+  mutate(k = as.factor(k))
+
+p_singlesite <-
+  site_ssd %>% 
+  ggplot(aes(m_ks , p_m_ks)) +
+  geom_line(aes(col = k), size = 1, alpha = 0.5) +
+  xlim(c(0,256)) +
+  ylim(c(0, 0.1)) +
+  geom_line(aes(m, pm_s), data = site_comm_pdf, lwd = 2) +
+  ylab("Probability density") +
+  xlab("Body mass (g)") +
+  theme_bw(24) +
+  theme(legend.position = "none", 
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) 
+
+
+# smallest
+fish_image_1 <- 
+  magick::image_read_svg("data/base/damsel.svg", width = 250) %>% 
+  magick::image_colorize(opacity = 100, color= "#e46df5")
+
+
+# medium
+fish_image_2 <- 
+  magick::image_read_svg("data/base/tang.svg", width = 250) %>% 
+  magick::image_colorize(opacity = 100, color= "#00b9e3")
+
+
+# largest
+fish_image_3 <- 
+  magick::image_read_svg("data/base/wrasse.svg", width = 250) %>% 
+  magick::image_colorize(opacity = 100, color= "#b3a000")
+
+
+# Species SSDs to be used as examples
+seg_dat <- 
+  tibble(k = c("Pomacentrus bankanensis", "Hemitaurichthys zoster", "Chaetodon falcula"),
+         col = c("#E46DF5", "#00B9E3", "#B3A000"),
+         xstart = c(20, 42.5, 90),
+         ystart = c(0.05, 0.034, 0.017), 
+         xend = c(5.0025, 28.3525,75), 
+         yend = c(0.05, 0.03, 0.0085))
+
+inset <- 
+  site_ssd %>% 
+  ggplot(aes(log(m_ks) , log(p_m_ks))) +
+  geom_line(aes(col = k), size = 1, alpha = 0.5) +
+  geom_line(aes(log(m), log(pm_s)), data = site_comm_pdf, lwd = 1.5) +
+  ylab("log(Probability density)") +
+  xlab("log(Body mass)") +
+  theme_bw(20) +
+  theme(legend.position = "none", 
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.text = element_text(),
+        plot.background = element_rect(
+          fill = "white",
+          colour = "black",
+          size = 1))  + 
+  annotation_logticks() +
+  ylim(c(-15, 0)) 
+
+
+main_plot <- 
+  p_singlesite +
+  draw_image(image = fish_image_1, 
+             x = 20, 
+             y = 0.05, 
+             scale = 10, 
+             hjust = 0.5, 
+             vjust = 0.5) +
+  geom_segment(aes(xend = xend, yend = yend, x = xstart, y =ystart),
+               col = "#E46DF5",  
+               data = seg_dat %>% filter(k == "Pomacentrus bankanensis"), 
+               size = 1) +
+  geom_point(aes(x = xend, y =yend), 
+             col = "#E46DF5",  
+             data = seg_dat %>% filter(k == "Pomacentrus bankanensis")) +
+  draw_image(image = fish_image_2, 
+             x = 45, 
+             y = 0.035, 
+             scale = 20, 
+             hjust = 0.5, 
+             vjust = 0.5) +
+  geom_segment(aes(xend = xend, yend = yend, x = xstart, y =ystart),
+               col = "#00B9E3",  
+               data = seg_dat %>% filter(k == "Hemitaurichthys zoster"), 
+               size = 1) +
+  geom_point(aes(x = xend, y = yend), col = "#00B9E3",  data = seg_dat %>% filter(k == "Hemitaurichthys zoster") ) +
+  draw_image(image = fish_image_3, 
+             x = 100, 
+             y = 0.016, 
+             scale = 50, 
+             hjust = 0.5, 
+             vjust = 0.5) +
+  geom_segment(aes(xend = xend, yend = yend, x = xstart, y =ystart),
+               col = "#B3A000",  
+               data = seg_dat %>% filter(k == "Chaetodon falcula"), 
+               size = 1) +
+  geom_point(aes(x = xend, y =yend), 
+             col = "#B3A000",  
+             data = seg_dat %>% 
+               filter(k == "Chaetodon falcula")) 
+
+fig_1 <- 
+  ggdraw(main_plot +
+           annotate("text", label = "p(m)[1]=='LN('*mu[1]*','*sigma[1]^{2}*')'",parse = TRUE, x = 50, y = 0.05, size = 6, colour = "#E46DF5") +
+           annotate("text", label = "p(m)[2]=='LN('*mu[2]*','*sigma[2]^{2}*')'",parse = TRUE, x = 75, y = 0.035, size = 6, colour = "#00B9E3") +
+           annotate("text", label = "p(m)[3]=='LN('*mu[3]*','*sigma[3]^{2}*')'",parse = TRUE, x = 110, y = 0.025, size = 6, colour = "#B3A000") +
+           annotate("text", label = "p(m) == N[1]*p(m)[1]+N[2]*p(m)[2]+N[3]*p(m)[3]*'...'",
+                    parse = TRUE, x = 10, y = 0.075, size = 8, colour = "black", hjust = 0, vjust = 0.5) +
+           geom_segment(x = 9, y = 0.075, xend = 3, yend = 0.074, colour = "black", size = 1)) +
+  draw_plot(inset, .95, .95, .4, .4, hjust = 1, vjust = 1)
+
+save_as_plot(fig_1, "fig_1", output_type = c("png", "eps", "pdf"), asp_ratio = 0.75)
+knitr::include_graphics("output/figs/png/fig_1.png")
+
+```
+
+**Figure 1.** Methodology diagram, showing the summation of lognormal SSDs
+
+
+# Figure 2
+
+```{r}
+
+plot_obs_data <- 
+  comm_pdf_all %>% 
+  filter(source == "obs") %>% 
+  select(-source) 
+
+fig_2_a <- 
+  comm_pdf_all %>% 
+  filter(source != "obs") %>% 
+  mutate(source = factor(source, levels = c("lmfit", "est", "LMAX"))) %>% 
+  ggplot(aes(x = log2(m), y = log2(density), col = source)) +
+  facet_wrap(.~source, ncol = 3) +
+  geom_point(alpha = 0.5, data = plot_obs_data, col = "black") +
+  geom_path(alpha = 0.2, 
+            size = 1, 
+            aes(group = s)) +
+  ylab("log(abundance)") +
+  xlab("log(mass)") +
+  theme_bw(24) +
+  theme(strip.background = element_blank(),
+        strip.text.x = element_blank(), 
+        axis.text = element_text(size = 14), 
+        legend.position = "none",
+        panel.spacing = unit(0, "lines"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "grey90"),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"), 
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank()) +
+  scale_y_continuous(breaks = seq(-20, 10, by = 10)) +
+  scale_color_manual(values = c("black", "red", "blue"))
+
+fig_2_a <- 
+  comm_pdf_all %>% 
+  filter(source != "obs") %>% 
+  mutate(source = factor(source, levels = c("lmfit", "est", "LMAX"))) %>% 
+  ggplot(aes(x = log2(m), y = log2(norm_density), col = source)) +
+  facet_wrap(.~source, ncol = 3) +
+  geom_point(alpha = 0.5, data = plot_obs_data, col = "black") +
+  geom_path(alpha = 0.2, 
+            size = 1, 
+            aes(group = s)) +
+  ylab("log(abundance density)") +
+  xlab("log(mass)") +
+  theme_bw(24) +
+  theme(strip.background = element_blank(),
+        strip.text.x = element_blank(), 
+        axis.text = element_text(size = 14), 
+        legend.position = "bottom",
+        legend.text = element_text(size = 20),
+        legend.title = element_blank(),
+        panel.spacing = unit(0, "lines"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "grey90"),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black")) +
+  scale_y_continuous(breaks = seq(-20, 10, by = 10)) +
+  # scale_color_manual(values = c("black", "red", "blue"))
+  scale_color_manual(labels = c("Fitted linear model", "Global-average SSD", bquote("SSD estimated from" ~ M[infinity])), 
+                     values = c("black", "red", "blue"),
+                     guide = guide_legend(override.aes = list(alpha = 1, size = 1.5)))
+
+
+fig_2 <-
+  plot_grid(fig_2_a, fig_2_b, ncol = 1, rel_heights = c(1, 1.4), align = "v")
+
+save_as_plot(fig_2, "fig_2", output_type = c("png", "eps", "pdf"))
+knitr::include_graphics("output/figs/png/fig_2.png")
+```
+
+# Table 1
+
+```{r}
+
+```
+
+
+
+# Figure 3
+
+## Plot data cleaning
+
+```{r}
+test_richness <- read_csv("data/base/test_richness.csv")
+
+lm_coefs_richness <- 
+  test_richness %>% 
+  na.omit() %>% 
+  group_by(s) %>% 
+  nest() %>% 
+  mutate(mod = map(.x = data, ~lm(log2(.x$nspp) ~ log2(.x$m)))) %>% 
+  mutate(beta = map_dbl(mod, ~ .x$coefficients[1]),
+         lambda = map_dbl(mod, ~ .x$coefficients[2]),
+         rsq =  map_dbl(mod, ~ summary(.x)$adj.r.squared)) %>% 
+  mutate(mod_norm = map(.x = data, ~lm(log2(.x$norm_nspp) ~ log2(.x$m)))) %>% 
+  mutate(beta_norm = map_dbl(mod_norm, ~ .x$coefficients[1]),
+         lambda_norm = map_dbl(mod_norm, ~ .x$coefficients[2]),
+         rsq_norm =  map_dbl(mod_norm, ~ summary(.x)$adj.r.squared)) %>% 
+  select(s, beta, lambda, rsq, beta_norm, lambda_norm, rsq_norm)
+
+richness_fit_lm <- 
+  test_richness %>% 
+  filter(source == "obs") %>% 
+  left_join(lm_coefs_richness %>% select(s, beta, lambda, beta_norm, lambda_norm)) %>% 
+  mutate(nspp = 2^(beta + lambda*log2(m))) %>%
+  mutate(norm_nspp = 2^(beta_norm + lambda_norm*log2(m))) %>%
+  select(-c(beta, lambda, beta_norm, lambda_norm)) %>% 
+  mutate(source = "lmfit")
+
+richness_comm_pdf <- 
+  test_richness %>% 
+  bind_rows(richness_fit_lm)
+
+```
+
+## The figure 
+
+```{r}
+
+richness_comm_pdf_obs <- 
+  richness_comm_pdf %>% 
+  filter(source == "obs") %>% 
+  select(-source)
+
+fig_3 <- 
+  richness_comm_pdf %>% 
+  filter(source != "obs") %>% 
+  mutate(source = factor(source, levels = c("lmfit", "est", "LMAX"))) %>% 
+  ggplot(aes(x = log2(m), y = log2(nspp), col = source)) +
+  facet_wrap(.~source, ncol = 3) +
+  geom_point(alpha = 0.5, data = richness_comm_pdf_obs, col = "black") +
+  geom_path(alpha = 0.2, 
+            size = 1, 
+            aes(group = s)) +
+  ylab("log(richness)") +
+  xlab("log(mass)") +
+  theme_bw(24) +
+  theme(strip.background = element_blank(),
+        strip.text.x = element_blank(), 
+        axis.text = element_text(size = 14), 
+        legend.position = "none",
+        panel.spacing = unit(0, "lines"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "grey90"),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black")
+  ) +
+  scale_color_manual(values = c("black", "red", "blue")) 
+
+
+save_as_plot(fig_3, "fig_3",c("png", "pdf", "eps"), asp_ratio = 3, height = 5)
+knitr::include_graphics("output/figs/png/fig_3.png")
+
+```
+
+
+# Figure 4
+
+```{r}
+divabun_alldata <- read_csv("data/base/divabun_alldata.csv")
+
+lm_obs <- lm(log2(nspp) ~ log2(density) + log2(n_surveys) , data = divabun_alldata %>% left_join(nsurv) %>% filter(source == "obs"))
+lm_est <- lm(log2(nspp) ~ log2(density) + log2(n_surveys), data = divabun_alldata %>% left_join(nsurv) %>% filter(source == "est"))
+lm_LMAX <- lm(log2(nspp) ~ log2(density) + log2(n_surveys), data = divabun_alldata %>% left_join(nsurv) %>% filter(source == "LMAX"))
+
+lm_obs_norm <- lm(log2(norm_nspp) ~ log2(norm_density) + log2(n_surveys) , data = divabun_alldata %>% left_join(nsurv) %>% filter(source == "obs"))
+lm_est_norm <- lm(log2(norm_nspp) ~ log2(norm_density) + log2(n_surveys), data = divabun_alldata %>% left_join(nsurv) %>% filter(source == "est"))
+lm_LMAX_norm <- lm(log2(norm_nspp) ~ log2(norm_density) + log2(n_surveys), data = divabun_alldata %>% left_join(nsurv) %>% filter(source == "LMAX"))
+
+
+
+
+bins_v2 <- 
+  data.frame(bin_num = 0:10) %>% 
+  mutate(
+    bin_floor = 2^bin_num,
+    bin_ceiling = 2^(bin_num + 1)-1,
+    bin_mid = (bin_floor + bin_ceiling) / 2,
+    bin_width = bin_ceiling - bin_floor
+  )
+
+fig_4_data <-
+  divabun_alldata %>% 
+  filter(source == "obs") %>% 
+  mutate(new_nsurv = 4) %>% 
+  left_join(nsurv) %>% 
+  mutate(bin_nsurv = bins_v2$bin_mid[.bincode(n_surveys+0.01, bins_v2$bin_floor)]) %>% 
+  mutate(bin_nsurv_f = bins_v2$bin_floor[.bincode(n_surveys+0.01, bins_v2$bin_floor)]) %>% 
+  mutate(bin_nsurv_c = bins_v2$bin_ceiling[.bincode(n_surveys+0.01, bins_v2$bin_floor)]) %>% 
+  
+  mutate(norm_nspp_obs_fit = 2^predict(lm_obs_norm, newdata = list(norm_density = norm_density, n_surveys = bin_nsurv))) %>% 
+  mutate(norm_nspp_est_fit = 2^predict(lm_est_norm, newdata = list(norm_density = norm_density, n_surveys = bin_nsurv))) %>% 
+  mutate(norm_nspp_LMAX_fit = 2^predict(lm_LMAX_norm, newdata = list(norm_density = norm_density, n_surveys = bin_nsurv))) %>% 
+  
+  mutate(nspp_obs_fit = 2^predict(lm_obs, newdata = list(density = density, n_surveys = bin_nsurv))) %>% 
+  mutate(nspp_est_fit = 2^predict(lm_est, newdata = list(density = density, n_surveys = bin_nsurv))) %>% 
+  mutate(nspp_LMAX_fit = 2^predict(lm_LMAX, newdata = list(density = density, n_surveys = bin_nsurv))) %>% 
+  
+  mutate(n_surveys_bin = case_when(n_surveys == 1 ~ "1",
+                                   TRUE ~ paste(bin_nsurv_f, "-", bin_nsurv_c))) 
+
+
+small_fish_1 <- 
+  magick::image_read_svg("data/base/damsel.svg", width = 100) %>% 
+  magick::image_colorize(opacity = 100, color= "black")
+
+small_fish_2 <- 
+  magick::image_read_svg("data/base/sweetlips.svg", width = 100) %>% 
+  magick::image_colorize(opacity = 100, color= "black")
+
+small_fish_3 <- 
+  magick::image_read_svg("data/base/tang.svg", width = 100) %>% 
+  magick::image_colorize(opacity = 100, color= "black")
+
+
+big_fish_1 <- 
+  magick::image_read_svg("data/base/shark.svg", width = 500) %>% 
+  magick::image_colorize(opacity = 100, color= "black")
+
+
+
+fig_4 <-
+  fig_4_data %>% 
+  mutate(n_surveys_bin = fct_reorder(n_surveys_bin, n_surveys)) %>%
+  ggplot(aes(log2(density), log2(nspp), col = n_surveys_bin, group = n_surveys_bin)) +
+  geom_point(alpha = 0.1, show.legend = F) +
+  viridis::scale_color_viridis(discrete = T, option = "D") + 
+  geom_line(alpha = 0.8, size = 1.5, aes(y = log2(nspp_obs_fit)), show.legend = T) +
+  xlab(expression(paste(log[2],"(Abundance)"))) +
+  ylab(expression(paste(log[2],"(Richness)"))) +
+  theme_bw(24) +
+  theme(strip.background = element_blank(),
+        strip.text.x = element_blank(), 
+        panel.spacing = unit(0, "lines"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+        legend.position = c(.05, .95),
+        legend.justification = c("left", "top"),
+        legend.box.just = "left",
+        legend.margin = margin(6, 6, 6, 6),
+        legend.background = element_rect(fill = "transparent")) +
+  labs(col = "Number of surveys") +
+  draw_image(image = small_fish_3, 
+             x = 3, 
+             y = 8.5, 
+             scale = 0.75, 
+             hjust = 0.5, 
+             vjust = 0.5) +
+  draw_image(image = small_fish_2, 
+             x = 4, 
+             y = 8, 
+             scale = 0.75, 
+             hjust = 0.5, 
+             vjust = 0.5) +
+  draw_image(image = small_fish_1, 
+             x = 3, 
+             y = 7.5, 
+             scale = 0.75, 
+             hjust = 0.5, 
+             vjust = 0.5) +
+  draw_image(image = big_fish_1, 
+             x = -14, 
+             y = 0, 
+             scale = 3, 
+             hjust = 0, 
+             vjust = 0) 
+
+
+
+save_as_plot(fig_4, "fig_4",c("png", "pdf", "eps"))
+knitr::include_graphics("output/figs/png/fig_4.png")
+
+```
+
+
+# Figure S1
+
+```{r}
+ssd_data <- read_csv("data/base/lmax_mod_data.csv")
+
+# model to predict mean body size from asymtotic size
+pred_mu_k <- lm(mu_k ~ log(m_max), data = ssd_data)
+
+
+fig_s1 <- 
+  ssd_data %>% 
+  mutate(fit = predict(pred_mu_k)) %>% 
+  ggplot(aes(log(m_max), mu_k)) +
+  geom_point() +
+  geom_line(aes(y = fit), col = "red", size = 1.5) +
+  theme_bw(24) +
+  labs(y = expression(mu[k]),
+       x = expression(log(m[infinity]))) +
+  theme(strip.background = element_blank(),
+        strip.text.x = element_blank(), 
+        panel.spacing = unit(0, "lines"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"), 
+        axis.title.y = element_text(angle = 0, vjust = 0.5))
+
+save_as_plot(fig_s1, "fig_s1",c("png", "pdf", "eps"))
+knitr::include_graphics("output/figs/png/fig_s1.png")
+
+```
+
+# Figure S2
+
+```{r}
+# mean sigma value (doesn't vary with asymptotic mass)
+mean_sigma_k <- mean(ssd_data$sigma_k, na.rm = T)
+
+fig_s2 <- 
+  ssd_data %>% 
+  mutate(fit = predict(pred_mu_k)) %>% 
+  ggplot(aes(log(m_max), sigma_k)) +
+  geom_point() +
+  geom_line(y = mean_sigma_k, col = "red", size = 1.5) +
+  theme_bw(24) +
+  labs(y = expression(sigma[k]^2 ),
+       x = expression(log(m[infinity]))) +
+  theme(strip.background = element_blank(),
+        strip.text.x = element_blank(), 
+        panel.spacing = unit(0, "lines"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"), 
+        axis.title.y = element_text(angle = 0, vjust = 0.5))
+
+save_as_plot(fig_s2, "fig_s2",c("png", "pdf", "eps"))
+knitr::include_graphics("output/figs/png/fig_s2.png")
+
+```
+
+# Figure S3
+
+```{r}
+
+gof_data <- read_csv("data/base/r2_rmse_ests.csv")
+
+fig_s3 <- 
+  comm_pdf_all %>% 
+  filter(source != "obs") %>% 
+  left_join(gof_data) %>% 
+  mutate(ypos = case_when(source == "lmfit" ~ 10, 
+                          source == "est" ~ 6,
+                          source == "LMAX" ~ 2)) %>% 
+  mutate(source = factor(source, levels = c("lmfit", "est", "LMAX"))) %>% 
+  ggplot(aes(x = log2(m), y = log2(density))) +
+  facet_wrap(.~s) +
+  geom_point(alpha = 0.5, data = comm_pdf_all %>% filter(source == "obs"), col = "black") +
+  geom_line(aes(col = source), 
+            alpha = 0.5, 
+            size = 1.3) +
+  geom_text(aes(x = 17.5, y = ypos, label = rmse %>% format(nsmall=2), col = source),
+            hjust   = 1,
+            vjust   = 1,
+            size = 4,
+            alpha = 0.8) +
+  geom_text(aes(x = 0, y = 10, label = s),
+            hjust   = 0,
+            vjust   = 1,
+            size = 4,
+            alpha = 1,
+            col = "grey60") +
+  ylab("log(abundance)") +
+  xlab("log(mass)") +
+  theme_bw(24) +
+  theme(strip.background = element_blank(),
+        strip.text.x = element_blank(),
+        axis.text = element_text(size = 14),
+        legend.position = "none",
+        panel.spacing = unit(0, "lines"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "grey90"),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black")) +
+  scale_y_continuous(breaks = seq(-20, 10, by = 10))+
+  scale_color_manual(values = c("black", "red", "blue"))
+
+save_as_plot(fig_s3, "fig_s3",c("png", "pdf", "eps"))
+knitr::include_graphics("output/figs/png/fig_s3.png")
+
+```
+
+# Figure S4
+
+```{r}
+
+```
+
+# Figure S5
+
+```{r}
+
+```
+
+# Figure S6
+
+```{r}
+
+```
+
+
+# Figure S7
+
+```{r}
+
+fig_3_b <- 
+  richness_comm_pdf %>% 
+  filter(source != "obs") %>% 
+  mutate(source = factor(source, levels = c("lmfit", "est", "LMAX"))) %>% 
+  ggplot(aes(x = log2(m), y = log2(norm_nspp), col = source)) +
+  facet_wrap(.~source, ncol = 3) +
+  geom_point(alpha = 0.5, data = richness_comm_pdf_obs, col = "black") +
+  geom_path(alpha = 0.2, 
+            size = 1, 
+            aes(group = s)) +
+  ylab("log(richness density)") +
+  xlab("log(mass)") +
+  theme_bw(24) +
+  theme(strip.background = element_blank(),
+        strip.text.x = element_blank(), 
+        axis.text = element_text(size = 14), 
+        legend.position = "bottom",
+        legend.text = element_text(size = 20),
+        legend.title = element_blank(),
+        panel.spacing = unit(0, "lines"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "grey90"),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black")) +
+  scale_color_manual(labels = c("Fitted linear model", "Global-average SSD", bquote("SSD estimated from" ~ M[infinity])), 
+                     values = c("black", "red", "blue"),
+                     guide = guide_legend(override.aes = list(alpha = 1, size = 1.5))) 
+
+fig_s7 <- plot_grid(fig_3, fig_3_b, labels = "AUTO", ncol = 1, rel_heights = c(1, 1.4), align = "v")
+
+
+save_as_plot(fig_s7, "fig_s7",c("png", "pdf", "eps"), asp_ratio = 3, height = 5)
+knitr::include_graphics("output/figs/png/fig_s7.png")
+
+```
+
+# Figure S8
+
+```{r}
+
+```
+
+# Figure S9
+
+```{r}
+
+```
+
+
+# Figure S10
+
+```{r}
+
+```
